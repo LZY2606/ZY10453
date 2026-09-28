@@ -6,6 +6,7 @@ like MongoDB (via motor) and Redis (via redis.asyncio).
 
 import asyncio
 import pickle
+from contextlib import suppress
 from itertools import chain
 from typing import Optional
 
@@ -268,11 +269,44 @@ class AsyncMinHashLSH:
             raise ValueError("The given key already exists")
         Hs = [self._H(minhash.hashvalues[start:end]) for start, end in self.hashranges]
 
-        fs = chain(
-            (self.keys.insert(key, *Hs, buffer=buffer),),
-            (hashtable.insert(H, key, buffer=buffer) for H, hashtable in zip(Hs, self.hashtables)),
-        )
-        await asyncio.gather(*fs)
+        # State machine of one insert: first the key -> Hs record, then the
+        # H -> key bucket entries across all bands. Backends are not assumed
+        # to support multi-key transactions, so a failure triggers
+        # best-effort compensation with the same storage primitives to avoid
+        # leaving the key in only one direction of the index. The bucket
+        # writes are gathered with return_exceptions=True so that no band
+        # write is left running in the background after a failure; because
+        # the concurrent writes make it impossible to know exactly which
+        # bands landed, every band is compensated and backends absorb the
+        # no-op removals. Compensation failures are suppressed so the
+        # original exception locates the failing stage.
+        key_recorded = False
+        try:
+            await self.keys.insert(key, *Hs, buffer=buffer)
+            key_recorded = True
+            results = await asyncio.gather(
+                *(hashtable.insert(H, key, buffer=buffer) for H, hashtable in zip(Hs, self.hashtables)),
+                return_exceptions=True,
+            )
+            failures = [result for result in results if isinstance(result, BaseException)]
+            if failures:
+                raise failures[0]
+        except Exception:
+            await asyncio.gather(
+                *(self._remove_val_quiet(hashtable, H, key) for H, hashtable in zip(Hs, self.hashtables)),
+                return_exceptions=True,
+            )
+            if key_recorded:
+                with suppress(Exception):
+                    await self.keys.remove(key)
+            raise
+
+    @staticmethod
+    async def _remove_val_quiet(hashtable, H, key):
+        with suppress(Exception):
+            await hashtable.remove_val(H, key)
+            if not await hashtable.get(H):
+                await hashtable.remove(H)
 
     async def query(self, minhash):
         """See :class:`datasketch.MinHashLSH`."""
@@ -308,12 +342,29 @@ class AsyncMinHashLSH:
         if not await self.keys.has_key(key):
             raise ValueError("The given key does not exist")
 
-        for H, hashtable in zip(await self.keys.get(key), self.hashtables):
-            await hashtable.remove_val(H, key, buffer=buffer)
-            if not await hashtable.get(H):
-                await hashtable.remove(H, buffer=buffer)
-
-        await self.keys.remove(key, buffer=buffer)
+        Hs = list(await self.keys.get(key))
+        # State machine of one remove: first the H -> key bucket entries, one
+        # band at a time, then the key -> Hs record. On failure the entries
+        # already removed are restored best-effort so the key is not left in
+        # only one direction of the index; no backend transaction support is
+        # assumed, and compensation failures are suppressed so the original
+        # exception locates the failing stage.
+        removed = []
+        try:
+            for H, hashtable in zip(Hs, self.hashtables):
+                await hashtable.remove_val(H, key, buffer=buffer)
+                removed.append((hashtable, H))
+                if not await hashtable.get(H):
+                    await hashtable.remove(H, buffer=buffer)
+            await self.keys.remove(key, buffer=buffer)
+        except Exception:
+            for hashtable, H in reversed(removed):
+                with suppress(Exception):
+                    await hashtable.insert(H, key)
+            if not await self.keys.has_key(key):
+                with suppress(Exception):
+                    await self.keys.insert(key, *Hs)
+            raise
 
     async def is_empty(self):
         """See :class:`datasketch.MinHashLSH`."""

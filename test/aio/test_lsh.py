@@ -7,12 +7,15 @@ from itertools import chain, islice
 
 import numpy as np
 import pytest
-from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient
 
 from datasketch.aio import AsyncMinHashLSH
 from datasketch.minhash import MinHash
 from datasketch.weighted_minhash import WeightedMinHashGenerator
+
+AsyncIOMotorClient = pytest.importorskip(
+    "motor.motor_asyncio", reason="motor is not installed; async storage tests require the 'aio' extra"
+).AsyncIOMotorClient
 
 STORAGE_CONFIG_MONGO = {"type": "aiomongo"}
 MONGO_URL = os.environ.get("MONGO_UNIT_TEST_URL")

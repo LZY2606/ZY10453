@@ -581,5 +581,233 @@ class TestWeightedMinHashLSH(unittest.TestCase):
         self.assertTrue("b" in result)
 
 
+class InjectedStorageError(RuntimeError):
+    """Raised by ProbedStorage when the configured Nth operation is reached."""
+
+
+class StorageProbe:
+    """Records the order of mutating storage operations and injects one failure.
+
+    The probe fails the Nth (1-based) call of `fail_method` made through a
+    wrapper tagged `fail_tag`, letting a test target e.g. the 3rd bucket
+    write across all band tables.
+    """
+
+    def __init__(self):
+        self.ops = []
+        self.fail_tag = None
+        self.fail_method = None
+        self.fail_at = None
+        self._count = 0
+
+    def arm(self, tag, method, at):
+        self.fail_tag = tag
+        self.fail_method = method
+        self.fail_at = at
+        self._count = 0
+
+    def record(self, tag, method):
+        self.ops.append((tag, method))
+        if tag == self.fail_tag and method == self.fail_method:
+            self._count += 1
+            if self._count == self.fail_at:
+                raise InjectedStorageError(f"injected failure at {tag}.{method} call #{self._count}")
+
+
+class ProbedStorage:
+    """Wraps a storage instance, logging mutating calls to a StorageProbe."""
+
+    def __init__(self, inner, probe, tag):
+        self._inner = inner
+        self._probe = probe
+        self._tag = tag
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __contains__(self, key):
+        return key in self._inner
+
+    def __getitem__(self, key):
+        return self._inner[key]
+
+    def __iter__(self):
+        return iter(self._inner)
+
+    def __len__(self):
+        return len(self._inner)
+
+    def insert(self, *args, **kwargs):
+        self._probe.record(self._tag, "insert")
+        return self._inner.insert(*args, **kwargs)
+
+    def remove(self, *args, **kwargs):
+        self._probe.record(self._tag, "remove")
+        return self._inner.remove(*args, **kwargs)
+
+    def remove_val(self, *args, **kwargs):
+        self._probe.record(self._tag, "remove_val")
+        return self._inner.remove_val(*args, **kwargs)
+
+
+class TestMinHashLSHFailureStates(unittest.TestCase):
+    """Pin the insert/remove state machine of MinHashLSH against a fake
+    storage that fails on the Nth bucket write or delete.
+
+    The core invariant under test: after any internal failure, a key must
+    not be left in only one direction of the index (key -> Hs record without
+    bucket entries, or bucket entries without the key record). The in-memory
+    dict backend has no transaction support; the guarantees checked here come
+    from the LSH layer itself and therefore apply to every backend.
+    """
+
+    def _make_lsh(self, num_perm=16):
+        lsh = MinHashLSH(threshold=0.5, num_perm=num_perm)
+        probe = StorageProbe()
+        lsh.hashtables = [ProbedStorage(t, probe, "bucket") for t in lsh.hashtables]
+        lsh.keys = ProbedStorage(lsh.keys, probe, "keys")
+        return lsh, probe
+
+    @staticmethod
+    def _minhash(content, num_perm=16):
+        m = MinHash(num_perm)
+        m.update(content)
+        return m
+
+    def _assert_present_both_directions(self, lsh, key):
+        stored_Hs = list(lsh.keys.get(key))
+        self.assertEqual(len(stored_Hs), lsh.b, "key -> Hs record must hold one H per band")
+        for H, table in zip(stored_Hs, lsh.hashtables):
+            self.assertIn(key, list(table.get(H)), "bucket entry missing for band")
+
+    def _assert_absent_both_directions(self, lsh, key):
+        self.assertEqual(list(lsh.keys.get(key)), [], "key -> Hs record must be gone")
+        for table in lsh.hashtables:
+            for H in table:
+                self.assertNotIn(key, list(table.get(H)), "bucket entry left behind")
+
+    def test_insert_writes_key_record_before_bucket_entries(self):
+        lsh, probe = self._make_lsh()
+        m = self._minhash(b"a")
+        lsh.insert("a", m)
+        self.assertEqual(probe.ops[0], ("keys", "insert"))
+        self.assertEqual(probe.ops[1:], [("bucket", "insert")] * lsh.b)
+        self._assert_present_both_directions(lsh, "a")
+        self.assertIn("a", lsh.query(m))
+
+    def test_insertion_session_unclosed_dict_backend_applies_writes_immediately(self):
+        # The dict backend ignores `buffer`, so writes are visible before
+        # close(); this documents the in-memory state machine only. Buffered
+        # backends (e.g. Redis pipelines) flush at session close instead.
+        lsh, _ = self._make_lsh()
+        m = self._minhash(b"a")
+        session = lsh.insertion_session()
+        session.insert("a", m)
+        self.assertIn("a", lsh.query(m))
+        self._assert_present_both_directions(lsh, "a")
+        session.close()
+        session.close()  # close is idempotent
+        self._assert_present_both_directions(lsh, "a")
+
+    def test_insert_duplicate_key_raises_before_touching_storage(self):
+        lsh, probe = self._make_lsh()
+        m = self._minhash(b"a")
+        lsh.insert("a", m)
+        ops_before = list(probe.ops)
+        self.assertRaises(ValueError, lsh.insert, "a", m)
+        self.assertEqual(probe.ops, ops_before, "duplicate check must reject before any storage write")
+        self._assert_present_both_directions(lsh, "a")
+        self.assertIn("a", lsh.query(m))
+
+    def test_insert_failure_at_nth_bucket_write_leaves_no_one_directional_residue(self):
+        for fail_at in (1, 3, 5):  # first band, middle band, last band (b=5 for num_perm=16)
+            lsh, probe = self._make_lsh()
+            self.assertEqual(lsh.b, 5)
+            m = self._minhash(b"x")
+            lsh.insert("ok", self._minhash(b"ok"))
+            probe.arm("bucket", "insert", fail_at)
+            with self.assertRaises(InjectedStorageError, msg=f"failure at bucket write #{fail_at}"):
+                lsh.insert("x", m)
+            # The failed key must not survive in only one direction.
+            self._assert_absent_both_directions(lsh, "x")
+            self.assertNotIn("x", lsh.query(m))
+            # Compensation must appear in the recorded op order.
+            compensated = probe.ops.count(("bucket", "remove_val"))
+            self.assertEqual(compensated, fail_at - 1, "every landed bucket write must be compensated")
+            self.assertEqual(probe.ops[-1], ("keys", "remove"))
+            # The pre-existing key is untouched, and the index accepts the
+            # same key again after the blocked attempt.
+            self._assert_present_both_directions(lsh, "ok")
+            lsh.insert("x", m)
+            self._assert_present_both_directions(lsh, "x")
+            self.assertIn("x", lsh.query(m))
+
+    def test_insert_failure_rollback_preserves_colliding_key(self):
+        lsh, probe = self._make_lsh()
+        m = self._minhash(b"shared")
+        lsh.insert("good", m)  # same minhash -> shares every bucket with "bad"
+        probe.arm("bucket", "insert", 3)
+        with self.assertRaises(InjectedStorageError):
+            lsh.insert("bad", m)
+        # Rolling back the failed key must not evict the colliding good key.
+        self._assert_present_both_directions(lsh, "good")
+        self.assertIn("good", lsh.query(m))
+        self._assert_absent_both_directions(lsh, "bad")
+
+    def test_remove_failure_at_nth_bucket_delete_restores_both_directions(self):
+        for fail_at in (1, 3, 5):
+            lsh, probe = self._make_lsh()
+            m = self._minhash(b"x")
+            lsh.insert("x", m)
+            probe.arm("bucket", "remove_val", fail_at)
+            with self.assertRaises(InjectedStorageError, msg=f"failure at bucket delete #{fail_at}"):
+                lsh.remove("x")
+            # The blocked remove must leave the key fully indexed, not
+            # stranded in only one direction.
+            self._assert_present_both_directions(lsh, "x")
+            self.assertIn("x", lsh.query(m))
+            # A retry after the blocked remove completes the cleanup.
+            lsh.remove("x")
+            self._assert_absent_both_directions(lsh, "x")
+            self.assertNotIn("x", lsh.query(m))
+            self.assertTrue(lsh.is_empty())
+
+    def test_remove_failure_at_key_record_delete_restores_buckets(self):
+        lsh, probe = self._make_lsh()
+        m = self._minhash(b"x")
+        lsh.insert("x", m)
+        probe.arm("keys", "remove", 1)
+        with self.assertRaises(InjectedStorageError):
+            lsh.remove("x")
+        self._assert_present_both_directions(lsh, "x")
+        self.assertIn("x", lsh.query(m))
+        lsh.remove("x")
+        self._assert_absent_both_directions(lsh, "x")
+
+    def test_remove_missing_key_raises_without_touching_storage(self):
+        lsh, probe = self._make_lsh()
+        lsh.insert("a", self._minhash(b"a"))
+        ops_before = list(probe.ops)
+        self.assertRaises(ValueError, lsh.remove, "missing")
+        self.assertEqual(probe.ops, ops_before, "missing-key check must reject before any storage write")
+        self._assert_present_both_directions(lsh, "a")
+
+    def test_deletion_session_failure_then_successful_cleanup(self):
+        lsh, probe = self._make_lsh()
+        m = self._minhash(b"x")
+        lsh.insert("x", m)
+        lsh.insert("y", self._minhash(b"y"))
+        probe.arm("bucket", "remove_val", 2)
+        session = lsh.deletion_session()
+        with self.assertRaises(InjectedStorageError):
+            session.remove("x")
+        session.close()
+        self._assert_present_both_directions(lsh, "x")
+        with lsh.deletion_session() as session:
+            session.remove("x")
+        self._assert_absent_both_directions(lsh, "x")
+        self._assert_present_both_directions(lsh, "y")
+
+
 if __name__ == "__main__":
     unittest.main()

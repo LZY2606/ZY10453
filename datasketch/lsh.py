@@ -3,6 +3,7 @@ from __future__ import annotations
 import pickle
 import struct
 from collections.abc import Hashable
+from contextlib import suppress
 from typing import Callable, List, Optional, Union
 
 from scipy.integrate import quad as integrate
@@ -349,9 +350,32 @@ class MinHashLSH:
         if check_duplication and key in self.keys:
             raise ValueError("The given key already exists")
         Hs = [self._H(minhash.hashvalues[start:end]) for start, end in self.hashranges]
-        self.keys.insert(key, *Hs, buffer=buffer)
-        for H, hashtable in zip(Hs, self.hashtables):
-            hashtable.insert(H, key, buffer=buffer)
+        # State machine of one insert: first the key -> Hs record, then the
+        # H -> key bucket entries, one band at a time. Storage backends are
+        # not assumed to support multi-key transactions, so if a bucket write
+        # fails the writes already applied are compensated best-effort using
+        # the same storage primitives. This keeps the key from being left in
+        # only one direction of the index (e.g. queryable through no band yet
+        # present in the key record). Compensation failures are suppressed:
+        # the original exception is the one that locates the failing stage.
+        key_recorded = False
+        inserted = []
+        try:
+            self.keys.insert(key, *Hs, buffer=buffer)
+            key_recorded = True
+            for H, hashtable in zip(Hs, self.hashtables):
+                hashtable.insert(H, key, buffer=buffer)
+                inserted.append((hashtable, H))
+        except Exception:
+            for hashtable, H in reversed(inserted):
+                with suppress(Exception):
+                    hashtable.remove_val(H, key)
+                    if not hashtable.get(H):
+                        hashtable.remove(H)
+            if key_recorded:
+                with suppress(Exception):
+                    self.keys.remove(key)
+            raise
 
     def __equivalent(self, other: MinHashLSH) -> bool:
         """Returns:
@@ -546,11 +570,31 @@ class MinHashLSH:
             key = pickle.dumps(key)
         if key not in self.keys:
             raise ValueError("The given key does not exist")
-        for H, hashtable in zip(self.keys[key], self.hashtables):
-            hashtable.remove_val(H, key, buffer=buffer)
-            if not hashtable.get(H):
-                hashtable.remove(H, buffer=buffer)
-        self.keys.remove(key, buffer=buffer)
+        Hs = list(self.keys[key])
+        # State machine of one remove: first the H -> key bucket entries, one
+        # band at a time, then the key -> Hs record. If a bucket delete (or
+        # the final key-record delete) fails, the entries already removed are
+        # restored best-effort so the key is not left in only one direction
+        # of the index (e.g. present in the key record but missing from some
+        # bands). No backend transaction support is assumed; compensation
+        # uses the same storage primitives and its own failures are
+        # suppressed so the original exception locates the failing stage.
+        removed = []
+        try:
+            for H, hashtable in zip(Hs, self.hashtables):
+                hashtable.remove_val(H, key, buffer=buffer)
+                removed.append((hashtable, H))
+                if not hashtable.get(H):
+                    hashtable.remove(H, buffer=buffer)
+            self.keys.remove(key, buffer=buffer)
+        except Exception:
+            for hashtable, H in reversed(removed):
+                with suppress(Exception):
+                    hashtable.insert(H, key)
+            if key not in self.keys:
+                with suppress(Exception):
+                    self.keys.insert(key, *Hs)
+            raise
 
     def is_empty(self) -> bool:
         """Returns:
